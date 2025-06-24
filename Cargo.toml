@@ -7,3 +7,4 @@ edition = "2024"
 gif = "0.13.3"
 glam = "0.30"
 raqote = { version = "0.8.5", default-features = false }
+rayon = "1.10.0"
