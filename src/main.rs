@@ -2,7 +2,11 @@ use std::{f32::consts::TAU, fs::File};
 
 use glam::{DVec2, dvec2};
 use raqote::{DrawOptions, DrawTarget, PathBuilder, SolidSource, Transform};
-use rayon::{iter::ParallelIterator, slice::ParallelSlice};
+use rayon::{
+    iter::{ParallelBridge, ParallelIterator},
+    slice::ParallelSlice,
+};
+use rustfft::{FftPlanner, num_complex::Complex64};
 
 fn main() {
     let orbit = Orbit {
@@ -35,7 +39,122 @@ fn main() {
     };
 
     let simulated = simulate_closed(&config, &orbit);
-    render(&config, &orbit, &simulated);
+
+    let mut freqs = analyze(&simulated);
+    freqs.iter_mut().for_each(|freqs| optimize(0.01, freqs));
+    eprintln!("{freqs:#?}");
+
+    let by_body = invert(&simulated, Clone::clone);
+
+    let total_frames = simulated.len();
+    let mut compressed = Vec::new();
+    for (body_freqs, baseline) in freqs.iter().zip(by_body.iter()) {
+        let positions = inverse_analyze(total_frames, body_freqs);
+        println!("{}", rms_error(&positions, baseline));
+        compressed.push(positions);
+    }
+
+    let compressed = invert(&compressed, Clone::clone);
+    render(&config, &orbit, &compressed);
+}
+
+pub fn invert<T, O: Clone>(positions: &[Vec<T>], map: impl Fn(&T) -> O) -> Vec<Vec<O>> {
+    let mut by_body = vec![Vec::new(); positions[0].len()];
+
+    for frame in positions.iter() {
+        for (by_body, position) in by_body.iter_mut().zip(frame.iter()) {
+            by_body.push(map(position));
+        }
+    }
+
+    by_body
+}
+
+pub fn analyze(positions: &[Vec<DVec2>]) -> Vec<Vec<FrequencyComponent>> {
+    let mut planner = FftPlanner::new();
+    let frame_num = positions.len();
+    let fft = planner.plan_fft_forward(frame_num);
+
+    let mut freqs = invert(positions, |pos| Complex64 {
+        re: pos.x,
+        im: pos.y,
+    });
+
+    freqs
+        .iter_mut()
+        .par_bridge()
+        .for_each(|body| fft.process(body));
+
+    freqs
+        .into_iter()
+        .map(|frames| {
+            frames
+                .into_iter()
+                .enumerate()
+                .map(|(idx, freq)| fft_to_freq(idx, freq, frame_num))
+                .collect()
+        })
+        .collect()
+}
+
+pub fn fft_to_freq(idx: usize, fft: Complex64, frame_num: usize) -> FrequencyComponent {
+    let half = frame_num / 2;
+
+    let freq = if idx == 0 {
+        0.0
+    } else if idx < half {
+        idx as f64
+    } else {
+        (idx as f64) - (frame_num as f64)
+    };
+
+    FrequencyComponent {
+        freq: -freq,
+        amplitude: (fft.im * fft.im + fft.re * fft.re).sqrt() / frame_num as f64,
+        phase: (-fft.im).atan2(fft.re),
+    }
+}
+
+pub fn optimize(cutoff: f64, freqs: &mut Vec<FrequencyComponent>) {
+    let dc = freqs.iter().find(|freq| freq.freq.abs() < 0.001).cloned();
+    freqs.retain(|freq| freq.amplitude > cutoff);
+    freqs.extend(dc);
+}
+
+pub fn inverse_analyze(frames: usize, freqs: &[FrequencyComponent]) -> Vec<DVec2> {
+    (0..frames)
+        .map(|idx| {
+            let sample = (idx as f64) / (frames as f64);
+            freqs.iter().map(|freq| freq.sample(sample)).sum()
+        })
+        .collect()
+}
+
+pub fn rms_error(lhs: &[DVec2], rhs: &[DVec2]) -> f64 {
+    lhs.iter()
+        .zip(rhs.iter())
+        .map(|(lhs_pos, rhs_pos)| lhs_pos.distance_squared(*rhs_pos) / lhs.len() as f64)
+        .sum()
+}
+
+#[derive(Clone, Debug)]
+pub struct FrequencyComponent {
+    pub freq: f64,
+    pub amplitude: f64,
+    pub phase: f64,
+}
+
+impl FrequencyComponent {
+    pub const ZERO: Self = Self {
+        freq: 0.0,
+        amplitude: 0.0,
+        phase: 0.0,
+    };
+
+    pub fn sample(&self, at: f64) -> DVec2 {
+        let theta = std::f64::consts::TAU * at * self.freq + self.phase;
+        DVec2::from_angle(-theta) * self.amplitude
+    }
 }
 
 pub fn render(config: &SimulationConfig, orbit: &Orbit, positions: &[Vec<DVec2>]) {
