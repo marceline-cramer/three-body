@@ -1,6 +1,7 @@
-use std::{f32::consts::TAU, fs::File};
+use std::{f32::consts::TAU, fs::File, io::Write};
 
 use glam::DVec2;
+use pretty::RcDoc;
 use raqote::{DrawOptions, DrawTarget, PathBuilder, SolidSource, Transform};
 use rayon::{
     iter::{ParallelBridge, ParallelIterator},
@@ -12,31 +13,62 @@ use serde::{Deserialize, Serialize};
 fn main() {
     let config: Config = toml::from_str(&std::fs::read_to_string("orbits.toml").unwrap()).unwrap();
 
-    // hard-coded orbit from the configuration for now
-    let orbit = config.orbit[2].to_orbit();
-
     let sim_config = SimulationConfig {
         frames: 140,
         subframes: 100,
     };
 
-    let simulated = simulate_closed(&sim_config, &orbit);
+    // bake each orbit in the config in parallel
+    let orbits: Vec<_> = config
+        .orbit
+        .iter()
+        .par_bridge()
+        .map(|orbit| bake(&sim_config, orbit))
+        .collect();
 
-    let mut freqs = analyze(&simulated);
-    freqs.iter_mut().for_each(|freqs| optimize(0.001, freqs));
+    let doc = RcDoc::text("orbits = ").append(
+        pretty_elm_list(orbits.iter().map(BakedOrbit::to_doc))
+            .nest(2)
+            .group(),
+    );
+
+    let mut stdout = std::io::stdout();
+    let template = include_str!("OrbitsTemplate.elm");
+    stdout.write_all(template.as_bytes()).unwrap();
+    doc.render(80, &mut stdout).unwrap();
+    stdout.flush().unwrap();
+}
+
+pub fn bake(sim_config: &SimulationConfig, orbit_config: &OrbitConfig) -> BakedOrbit {
+    let orbit = orbit_config.to_orbit();
+
+    let simulated = simulate_closed(sim_config, &orbit);
+
+    let mut baked_bodies = analyze(&simulated);
+
+    baked_bodies
+        .iter_mut()
+        .for_each(|body| body.optimize(0.001));
 
     let by_body = transpose(&simulated, Clone::clone);
 
     let total_frames = simulated.len();
     let mut compressed = Vec::new();
-    for (body_freqs, baseline) in freqs.iter().zip(by_body.iter()) {
-        let positions = inverse_analyze(total_frames, body_freqs);
-        println!("optimization error: {}", rms_error(&positions, baseline));
+    for (body, baseline) in baked_bodies.iter().zip(by_body.iter()) {
+        let positions = inverse_analyze(total_frames, body);
+        eprintln!("optimization error: {}", rms_error(&positions, baseline));
         compressed.push(positions);
     }
 
     let compressed = transpose(&compressed, Clone::clone);
-    render(&sim_config, &orbit, &compressed);
+    render(sim_config, &orbit, &compressed);
+
+    BakedOrbit {
+        name: orbit_config.name.clone(),
+        period: orbit_config.period,
+        energy: orbit_config.energy,
+        bodies: baked_bodies.clone(),
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -48,6 +80,7 @@ pub struct Config {
 pub struct OrbitConfig {
     pub name: String,
     pub period: f64,
+    pub energy: f64,
     pub masses: Vec<f64>,
     pub positions: Vec<DVec2>,
     pub velocities: Vec<DVec2>,
@@ -76,13 +109,14 @@ impl OrbitConfig {
             .collect();
 
         Orbit {
+            name: self.name.clone(),
             initial_conds: bodies,
             period: self.period,
         }
     }
 }
 
-pub fn analyze(positions: &[Vec<DVec2>]) -> Vec<Vec<FrequencyComponent>> {
+pub fn analyze(positions: &[Vec<DVec2>]) -> Vec<BakedBody> {
     let mut planner = FftPlanner::new();
     let frame_num = positions.len();
     let fft = planner.plan_fft_forward(frame_num);
@@ -106,6 +140,7 @@ pub fn analyze(positions: &[Vec<DVec2>]) -> Vec<Vec<FrequencyComponent>> {
                 .map(|(idx, freq)| fft_to_freq(idx, freq, frame_num))
                 .collect()
         })
+        .map(|frequencies| BakedBody { frequencies })
         .collect()
 }
 
@@ -115,31 +150,70 @@ pub fn fft_to_freq(idx: usize, fft: Complex64, frame_num: usize) -> FrequencyCom
     let freq = if idx == 0 {
         0.0
     } else if idx < half {
-        idx as f64
+        -(idx as f64)
     } else {
-        (idx as f64) - (frame_num as f64)
+        (frame_num as f64) - (idx as f64)
     };
 
     FrequencyComponent {
-        freq: -freq,
+        freq,
         amplitude: (fft.im * fft.im + fft.re * fft.re).sqrt() / frame_num as f64,
         phase: (-fft.im).atan2(fft.re),
     }
 }
 
-pub fn optimize(cutoff: f64, freqs: &mut Vec<FrequencyComponent>) {
-    let original_length = freqs.len();
-    freqs.retain(|freq| freq.amplitude > cutoff || freq.freq.abs() < 0.01);
-    println!("optimized #freqs from {original_length} to {}", freqs.len());
-}
-
-pub fn inverse_analyze(frames: usize, freqs: &[FrequencyComponent]) -> Vec<DVec2> {
+pub fn inverse_analyze(frames: usize, body: &BakedBody) -> Vec<DVec2> {
     (0..frames)
         .map(|idx| {
             let sample = (idx as f64) / (frames as f64);
-            freqs.iter().map(|freq| freq.sample(sample)).sum()
+            body.frequencies
+                .iter()
+                .map(|freq| freq.sample(sample))
+                .sum()
         })
         .collect()
+}
+
+pub struct BakedOrbit {
+    pub name: String,
+    pub period: f64,
+    pub energy: f64,
+    pub bodies: Vec<BakedBody>,
+}
+
+impl BakedOrbit {
+    pub fn to_doc(&self) -> RcDoc<()> {
+        let name = RcDoc::text("\"").append(self.name.clone()).append("\"");
+        let bodies = pretty_elm_list(self.bodies.iter().map(BakedBody::to_doc));
+
+        pretty_elm_struct([
+            ("name", name),
+            ("period", RcDoc::text(self.period.to_string())),
+            ("energy", RcDoc::text(self.energy.to_string())),
+            ("bodies", bodies),
+        ])
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct BakedBody {
+    pub frequencies: Vec<FrequencyComponent>,
+}
+
+impl BakedBody {
+    pub fn to_doc(&self) -> RcDoc<()> {
+        pretty_elm_struct([(
+            "frequencies",
+            pretty_elm_list(self.frequencies.iter().map(FrequencyComponent::to_doc)),
+        )])
+    }
+
+    pub fn optimize(&mut self, cutoff: f64) {
+        let original_length = self.frequencies.len();
+        self.frequencies.retain(|freq| freq.amplitude > cutoff);
+        let new_length = self.frequencies.len();
+        eprintln!("optimized #freqs from {original_length} to {new_length}",);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -160,6 +234,43 @@ impl FrequencyComponent {
         let theta = std::f64::consts::TAU * at * self.freq + self.phase;
         DVec2::from_angle(-theta) * self.amplitude
     }
+
+    pub fn to_doc(&self) -> RcDoc<()> {
+        let fmt_real = |val: f64| {
+            let precision = 100000000.0;
+            RcDoc::text(((val * precision).round() / precision).to_string())
+        };
+
+        pretty_elm_struct([
+            ("freq", fmt_real(self.freq)),
+            ("amplitude", fmt_real(self.amplitude)),
+            ("phase", fmt_real(self.phase)),
+        ])
+    }
+}
+
+pub fn pretty_elm_struct<'a>(
+    fields: impl IntoIterator<Item = (&'static str, RcDoc<'a, ()>)>,
+) -> RcDoc<'a, ()> {
+    let inner = fields
+        .into_iter()
+        .map(|(name, value)| RcDoc::text(name).append(" = ").append(value));
+
+    RcDoc::text("{").append(pretty_elm_group(inner)).append("}")
+}
+
+pub fn pretty_elm_list<'a>(items: impl IntoIterator<Item = RcDoc<'a, ()>>) -> RcDoc<'a, ()> {
+    RcDoc::text("[").append(pretty_elm_group(items)).append("]")
+}
+
+pub fn pretty_elm_group<'a>(items: impl IntoIterator<Item = RcDoc<'a, ()>>) -> RcDoc<'a, ()> {
+    let items = items.into_iter().map(|doc| doc.nest(2));
+    let separator = RcDoc::hardline().flat_alt(RcDoc::nil()).append(", ");
+
+    RcDoc::space()
+        .append(RcDoc::intersperse(items, separator))
+        .append(RcDoc::line())
+        .group()
 }
 
 pub fn simulate_closed(config: &SimulationConfig, orbit: &Orbit) -> Vec<Vec<DVec2>> {
@@ -184,7 +295,7 @@ pub fn simulate_closed(config: &SimulationConfig, orbit: &Orbit) -> Vec<Vec<DVec
 
     for (forwards, backwards) in forwards_error.iter().zip(backwards_error.iter()) {
         let error = rms_error(forwards, backwards);
-        println!("closed simulation RMS error: {error}",);
+        eprintln!("closed simulation RMS error: {error}",);
         assert!(error < 0.001);
     }
 
@@ -220,7 +331,7 @@ pub fn simulate(config: &SimulationConfig, orbit: &Orbit) -> Vec<Vec<DVec2>> {
         history.push(last.clone())
     }
 
-    println!("start-end simulation drift: {}", rms_error(&first, &last));
+    eprintln!("start-end simulation drift: {}", rms_error(&first, &last));
 
     history
 }
@@ -269,7 +380,8 @@ pub fn render(config: &SimulationConfig, orbit: &Orbit, positions: &[Vec<DVec2>]
         })
         .collect();
 
-    let mut image = File::create("target/orbit.gif").unwrap();
+    let path = format!("target/{}.gif", orbit.name);
+    let mut image = File::create(&path).unwrap();
     let mut encoder = gif::Encoder::new(&mut image, width, height, &[]).unwrap();
     encoder.set_repeat(gif::Repeat::Infinite).unwrap();
 
@@ -286,6 +398,7 @@ pub struct SimulationConfig {
 
 #[derive(Clone, Debug)]
 pub struct Orbit {
+    pub name: String,
     pub initial_conds: Vec<Body>,
     pub period: f64,
 }
